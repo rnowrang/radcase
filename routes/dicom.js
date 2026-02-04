@@ -15,7 +15,8 @@ const DICOM_DIR = path.join(__dirname, '..', 'dicom');
 // DICOM upload configuration
 const dicomStorage = multer.diskStorage({
   destination: (req, file, cb) => {
-    const seriesId = req.params.seriesId || uuidv4();
+    // Reuse the same seriesId for all files in the upload
+    const seriesId = req.dicomSeriesId || req.params.seriesId || uuidv4();
     const seriesDir = path.join(DICOM_DIR, seriesId);
     fs.mkdirSync(seriesDir, { recursive: true });
     req.dicomSeriesId = seriesId;

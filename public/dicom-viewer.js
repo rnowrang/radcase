@@ -138,14 +138,12 @@ class DicomViewer {
     const presets = document.getElementById(`${this.containerId}-presets`);
     const toolBtns = this.container.querySelectorAll('.dicom-tool-btn');
 
-    // Slider change
-    slider.addEventListener('input', (e) => {
+    // Slider change - use onclick to avoid duplicate handlers
+    slider.oninput = (e) => {
       this.goToSlice(parseInt(e.target.value));
-    });
+    };
 
-    // Prev/Next buttons
-    prevBtn.addEventListener('click', () => this.previousSlice());
-    nextBtn.addEventListener('click', () => this.nextSlice());
+    // Prev/Next buttons - bound in bindSliceControls() to avoid duplicates
 
     // Reset button
     resetBtn.addEventListener('click', () => this.resetView());
