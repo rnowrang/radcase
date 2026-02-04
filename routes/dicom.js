@@ -85,7 +85,7 @@ router.get('/cases/:id/dicom', (req, res, next) => {
   }
 });
 
-// Upload DICOM series for a case
+// Upload DICOM series for a case - auto-detects and separates multiple series
 router.post('/cases/:id/dicom', requireAuth, dicomUpload.array('files', 1000), async (req, res, next) => {
   try {
     const caseId = req.params.id;
@@ -100,63 +100,113 @@ router.post('/cases/:id/dicom', requireAuth, dicomUpload.array('files', 1000), a
       return res.status(400).json({ error: 'No DICOM files provided' });
     }
 
-    const seriesId = req.dicomSeriesId || uuidv4();
-    const seriesDir = path.join(DICOM_DIR, seriesId);
-
-    fs.mkdirSync(seriesDir, { recursive: true });
-
-    let metadata = null;
-    const dicomFiles = [];
+    const uploadDir = req.dicomSeriesId ? path.join(DICOM_DIR, req.dicomSeriesId) : null;
     const parseErrors = [];
 
-    metadata = parseDicomFile(req.files[0].path);
-    if (!metadata) {
-      parseErrors.push({ filename: req.files[0].filename, error: 'Failed to parse DICOM metadata' });
-    }
+    // Group files by Series Instance UID
+    const seriesMap = new Map(); // seriesUID -> { metadata, files: [] }
 
     for (const file of req.files) {
       const fileMetadata = parseDicomFile(file.path);
       if (!fileMetadata) {
         parseErrors.push({ filename: file.filename, error: 'Failed to parse DICOM file' });
+        continue;
       }
-      dicomFiles.push({
+
+      // Use series UID as key, or generate one for files without it
+      const seriesUID = fileMetadata.seriesInstanceUID || 'unknown_series';
+
+      if (!seriesMap.has(seriesUID)) {
+        seriesMap.set(seriesUID, {
+          metadata: fileMetadata,
+          files: []
+        });
+      }
+
+      seriesMap.get(seriesUID).files.push({
+        path: file.path,
         filename: file.filename,
-        instanceNumber: fileMetadata?.instanceNumber || 0,
-        sliceLocation: fileMetadata?.sliceLocation
+        instanceNumber: fileMetadata.instanceNumber || 0,
+        sliceLocation: fileMetadata.sliceLocation
       });
     }
 
-    dicomFiles.sort((a, b) => {
-      if (a.sliceLocation !== null && b.sliceLocation !== null) {
-        return a.sliceLocation - b.sliceLocation;
-      }
-      return a.instanceNumber - b.instanceNumber;
-    });
+    // Create a series entry for each unique series
+    const createdSeries = [];
 
-    db.prepare(`
-      INSERT INTO dicom_series (
-        id, case_id, series_uid, series_description, modality, num_images,
-        folder_name, patient_name, study_description, window_center, window_width
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      seriesId,
-      caseId,
-      metadata?.seriesInstanceUID || null,
-      metadata?.seriesDescription || 'Unnamed Series',
-      metadata?.modality || 'Unknown',
-      dicomFiles.length,
-      seriesId,
-      metadata?.patientName || null,
-      metadata?.studyDescription || null,
-      metadata?.windowCenter || null,
-      metadata?.windowWidth || null
-    );
+    for (const [seriesUID, seriesData] of seriesMap) {
+      const seriesId = uuidv4();
+      const seriesDir = path.join(DICOM_DIR, seriesId);
+      fs.mkdirSync(seriesDir, { recursive: true });
+
+      // Sort files by slice location or instance number
+      seriesData.files.sort((a, b) => {
+        if (a.sliceLocation !== null && b.sliceLocation !== null) {
+          return a.sliceLocation - b.sliceLocation;
+        }
+        return a.instanceNumber - b.instanceNumber;
+      });
+
+      // Move files to the series folder
+      for (const file of seriesData.files) {
+        const newPath = path.join(seriesDir, file.filename);
+        try {
+          fs.renameSync(file.path, newPath);
+        } catch (e) {
+          // If rename fails (cross-device), copy and delete
+          fs.copyFileSync(file.path, newPath);
+          fs.unlinkSync(file.path);
+        }
+      }
+
+      const metadata = seriesData.metadata;
+
+      // Insert into database
+      db.prepare(`
+        INSERT INTO dicom_series (
+          id, case_id, series_uid, series_description, modality, num_images,
+          folder_name, patient_name, study_description, window_center, window_width
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        seriesId,
+        caseId,
+        metadata?.seriesInstanceUID || null,
+        metadata?.seriesDescription || 'Unnamed Series',
+        metadata?.modality || 'Unknown',
+        seriesData.files.length,
+        seriesId,
+        metadata?.patientName || null,
+        metadata?.studyDescription || null,
+        metadata?.windowCenter || null,
+        metadata?.windowWidth || null
+      );
+
+      createdSeries.push({
+        seriesId,
+        seriesUID,
+        seriesDescription: metadata?.seriesDescription || 'Unnamed Series',
+        modality: metadata?.modality || 'Unknown',
+        numImages: seriesData.files.length,
+        patientName: metadata?.patientName
+      });
+    }
+
+    // Clean up the original upload directory if it's empty
+    if (uploadDir && fs.existsSync(uploadDir)) {
+      try {
+        const remaining = fs.readdirSync(uploadDir);
+        if (remaining.length === 0) {
+          fs.rmdirSync(uploadDir);
+        }
+      } catch (e) {
+        // Ignore cleanup errors
+      }
+    }
 
     res.status(201).json({
-      seriesId,
-      numImages: dicomFiles.length,
-      metadata,
-      files: dicomFiles,
+      message: `Created ${createdSeries.length} series from ${req.files.length} files`,
+      series: createdSeries,
+      totalImages: req.files.length,
       ...(parseErrors.length > 0 && { parseWarnings: parseErrors })
     });
   } catch (err) {
